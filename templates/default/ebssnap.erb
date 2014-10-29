@@ -1,0 +1,60 @@
+#!/opt/chef/embedded/bin/ruby -W0
+######################################################################
+# digitaldreams Chef-Server Snapshot Tool                           ##
+#                                                                   ##
+# Copyright digitaldreams 2014                                      ##
+######################################################################
+## Setup Includes                                                   ##
+######################################################################
+require 'optparse'
+require 'aws-sdk'                  # For using the AWS-SDK
+require 'net/http'                 # For HTTP Parsing
+
+$aws_ec2_region        = `curl --silent http://169.254.169.254/latest/dynamic/instance-identity/document |grep region|awk -F: '{print $2}' | cut -d'"' -f 2`.strip!
+$aws_access_key_id     = "<%= @access_key_id %>"
+$aws_secret_access_key = "<%= @secret_access_key %>"
+$retention             = 2
+$hostname              = `hostname`.strip! 
+
+#puts $aws_ec2_region
+
+awscreds = {
+  :access_key_id     => $aws_access_key_id,
+  :secret_access_key => $aws_secret_access_key,
+  :region            => $aws_ec2_region
+}
+
+AWS.config(awscreds)
+ec2 = AWS::EC2.new
+
+# Get AWS instance_id and define instance_id attribute
+metadata_fetch_1 = 'http://169.254.169.254/latest/meta-data/'
+instance_id = Net::HTTP.get( URI.parse( metadata_fetch_1 + 'instance-id' ) )
+
+#puts "Instance-ID: #{instance_id}"
+
+# Get volumes from block devices
+volume_id = []
+device_list = ec2.instances["#{instance_id}"].block_device_mappings
+device_list.each do |blkdev|
+  #puts "Block device: #{blkdev}"
+  volume_id << ec2.instances["#{instance_id}"].block_device_mappings["#{blkdev}"].volume.id
+end
+
+# Create Snapshots for the Chef-Server
+volume_id.each do |id|
+  #puts "Creating snapshot for: #{id}"
+  snapshot = ec2.snapshots.create(:volume => ec2.volumes[id], :description => "#{$hostname}:(#{instance_id}):Volume=>#{id}:Frequency=><%= @frequency %>")
+  snapshot.add_tag('Name', :value => "#{$hostname}")
+    snapshots = ec2.snapshots.filter('tag-value', "#{$hostname}")
+    $snapshots_to_remain = snapshots.sort_by { |snap| snap.start_time }.reverse[0, $retention]
+    $snapshots_to_delete = snapshots.to_a - $snapshots_to_remain.to_a
+end
+
+# Purge older snapshots using a filter on the same volume-id.
+purge_snapshots = $snapshots_to_remain.each_with_object($snapshots_to_delete.dup){|(k, v), h| h.delete(k)}
+purge_snapshots.each do |snapshot|
+  #puts "Removing snapshot: #{snapshot.id}"
+  snapshot.delete
+end
+
